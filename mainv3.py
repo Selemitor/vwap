@@ -5,7 +5,6 @@ import numpy as np
 import os
 import time
 import random
-import keyboard
 import optuna
 import random
 from pathlib import Path
@@ -187,7 +186,6 @@ def main():
         while True:
             print(f"\n--- Cykl {cycle_num} ---")
             for timeframe in all_timeframes:
-                if keyboard.is_pressed('q'): raise KeyboardInterrupt
                 print(f"\n--- Interwał: {timeframe} ---")
                 pairs_for_timeframe = [p for p, tfs in files_structure.items() if timeframe in tfs and p in testing_tickers]
                 if not pairs_for_timeframe: 
@@ -337,4 +335,5 @@ def main():
 
 if __name__ == "__main__":
     multiprocessing.freeze_support()
+
     main()
