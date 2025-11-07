@@ -1,5 +1,8 @@
 # config.py
 from pathlib import Path
 
-# Ustaw ścieżkę do folderu, gdzie trzymasz wszystkie pliki CSV
-DATA_PATH = Path(r"D:\Skrypty\Dane mexc")
+# Znajdź ścieżkę do folderu, w którym znajduje się ten plik (czyli D:\Skrypty\VWAP\)
+SCRIPT_DIR = Path(__file__).resolve().parent
+
+# Ustaw ścieżkę danych jako podfolder "data" wewnątrz folderu projektu
+DATA_PATH = SCRIPT_DIR / "data"
