@@ -5,6 +5,7 @@ import numpy as np
 import os
 import time
 import random
+import keyboard
 import optuna
 import random
 from pathlib import Path
@@ -119,13 +120,22 @@ def main():
     files_structure = discover_data_files(); all_tickers = list(files_structure.keys()); market_caps = fetch_and_cache_market_caps(all_tickers)
     
     sorted_tickers = sorted(market_caps, key=market_caps.get, reverse=True)
-    num_training = 100; training_tickers = sorted_tickers[:num_training]; testing_tickers_full = sorted_tickers[num_training:]
-    
-    num_random_test = 100
-    if len(testing_tickers_full) > num_random_test:
-        testing_tickers = random.sample(testing_tickers_full, num_random_test)
-    else:
-        testing_tickers = testing_tickers_full
+
+    # --- NOWA LOGIKA WYBORU GRUP ---
+    print(f"Łącznie posortowanych tickerów: {len(sorted_tickers)}")
+
+    # Grupa Treningowa: TOP 1-100 (lub mniej, jeśli nie ma wystarczająco dużo)
+    num_training = 100
+    training_tickers = sorted_tickers[:num_training]
+
+    # Grupa Testowa: Miejsca 101-200 (zamiast losowych)
+    num_testing = 100
+    testing_tickers = sorted_tickers[num_training : num_training + num_testing]
+
+    if not testing_tickers:
+        print("OSTRZEŻENIE: Brak tickerów w grupie testowej (101-200). Używam reszty tickerów.")
+        testing_tickers = sorted_tickers[num_training:]
+    # --- KONIEC NOWEJ LOGIKI ---
         
     print("\n" + "="*50); print(f"📊 Podział na grupy:"); print(f"  -> Grupa Treningowa (TOP {num_training} MCap): {len(training_tickers)} par"); print(f"  -> Grupa Testowa (Losowa próbka): {len(testing_tickers)} par"); print("="*50)
     
@@ -186,6 +196,7 @@ def main():
         while True:
             print(f"\n--- Cykl {cycle_num} ---")
             for timeframe in all_timeframes:
+                if keyboard.is_pressed('q'): raise KeyboardInterrupt
                 print(f"\n--- Interwał: {timeframe} ---")
                 pairs_for_timeframe = [p for p, tfs in files_structure.items() if timeframe in tfs and p in testing_tickers]
                 if not pairs_for_timeframe: 
@@ -335,5 +346,4 @@ def main():
 
 if __name__ == "__main__":
     multiprocessing.freeze_support()
-
     main()
