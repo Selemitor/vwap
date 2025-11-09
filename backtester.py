@@ -232,8 +232,10 @@ def objective_function(trial, entry_model, exit_model, pairs_in_group, timeframe
     return total_pnl / len(pairs_in_group) if pairs_in_group else 0
 
 def optimize_timeframe_group(entry_model, exit_model, pairs_in_group, timeframe, n_trials=50, storage_dir="."):
-    study_name = f"study_{timeframe}_group_exit_manager"; storage_path = Path(storage_dir) / f"{study_name}.db"; storage_name = f"sqlite:///{storage_path}"
+    study_name = f"study_{timeframe}_group_exit_manager"
+    storage_name = "postgresql://postgres:twojehaslo@localhost:5432/optuna_db"
     study = optuna.create_study(direction="maximize", study_name=study_name, storage=storage_name, load_if_exists=True)
     objective_with_args = partial(objective_function, entry_model=entry_model, exit_model=exit_model, pairs_in_group=pairs_in_group, timeframe=timeframe)
     study.optimize(objective_with_args, n_trials=n_trials, n_jobs=-1, gc_after_trial=True)
+
     return study.best_params, study.best_value
