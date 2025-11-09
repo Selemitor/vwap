@@ -9,6 +9,7 @@ import optuna
 import random
 from pathlib import Path
 from indicators import add_rsi, add_wave_trend, add_trendline_features, add_atr, add_temporal_features
+
 from data_loader import discover_data_files, fetch_and_cache_market_caps, preload_all_data
 from backtester import optimize_timeframe_group, init_backtester_worker, run_simulation
 from analysis import analyze_by_market_cap
@@ -114,19 +115,48 @@ def get_combined_data_for_training(params, files_to_use, data_store, target_time
     return cleaned_df
 
 def main():
-    # --- Konfiguracja i ładowanie danych (bez zmian) ---
-    files_structure = discover_data_files(); all_tickers = list(files_structure.keys()); market_caps = fetch_and_cache_market_caps(all_tickers)
+    # --- Konfiguracja i ładowanie danych ---
+    files_structure_raw = discover_data_files() 
+
+    # --- NOWY BLOK: Filtracja Stablecoinów i Wrapped Tokens ---
+    print("🔍 Filtrowanie listy tickerów...")
+    # Lista bazowych walut stablecoinów do zignorowania
+    STABLECOINS = ['USDT', 'USDC', 'DAI', 'TUSD', 'BUSD', 'FDUSD', 'USDP', 'PYUSD', 'PAX', 'GUSD', 'USDD', 'FRAX']
+    # Główne Wrapped Tokens
+    BLACKLISTED_BASE_CURRENCIES = STABLECOINS + [
+        'WBTC', 'WETH', 'WBNB', 'WAVAX', 'WMATIC', 'WFTM', 
+        'STETH', 'RETH', 'CBETH', 'CETH', 'CDAI', 'CUSDC', 'AXLUSDC', 'SOBTC'
+    ]
+
+    files_structure = {} # Nowy, przefiltrowany słownik
+    
+    for ticker, timeframes in files_structure_raw.items():
+        try:
+            base_currency = ticker.split('_')[0].upper()
+            
+            if base_currency in BLACKLISTED_BASE_CURRENCIES:
+                continue
+                
+            # Jeśli przeszedł filtry, dodaj go
+            files_structure[ticker] = timeframes
+            
+        except Exception as e:
+            print(f"  -> Błąd filtrowania {ticker}: {e}")
+    
+    print(f"✅ Przefiltrowano. Pozostało {len(files_structure)} z {len(files_structure_raw)} par.")
+    # --- KONIEC BLOKU FILTRACJI ---
+
+    all_tickers = list(files_structure.keys())
+    market_caps = fetch_and_cache_market_caps(all_tickers)
     
     sorted_tickers = sorted(market_caps, key=market_caps.get, reverse=True)
 
     # --- NOWA LOGIKA WYBORU GRUP ---
     print(f"Łącznie posortowanych tickerów: {len(sorted_tickers)}")
 
-    # Grupa Treningowa: TOP 1-100 (lub mniej, jeśli nie ma wystarczająco dużo)
     num_training = 100
     training_tickers = sorted_tickers[:num_training]
 
-    # Grupa Testowa: Miejsca 101-200 (zamiast losowych)
     num_testing = 100
     testing_tickers = sorted_tickers[num_training : num_training + num_testing]
 
@@ -135,7 +165,7 @@ def main():
         testing_tickers = sorted_tickers[num_training:]
     # --- KONIEC NOWEJ LOGIKI ---
         
-    print("\n" + "="*50); print(f"📊 Podział na grupy:"); print(f"  -> Grupa Treningowa (TOP {num_training} MCap): {len(training_tickers)} par"); print(f"  -> Grupa Testowa (Losowa próbka): {len(testing_tickers)} par"); print("="*50)
+    print("\n" + "="*50); print(f"📊 Podział na grupy:"); print(f"  -> Grupa Treningowa (TOP {num_training} MCap): {len(training_tickers)} par"); print(f"  -> Grupa Testowa (Miejsca 101-{101+num_testing}): {len(testing_tickers)} par"); print("="*50)
     
     tickers_to_load = list(set(training_tickers + testing_tickers)); files_structure_to_load = {k: v for k, v in files_structure.items() if k in tickers_to_load}
     print(f"\nŁącznie zostanie wczytanych {len(tickers_to_load)} par (treningowe + testowe)."); data_store = preload_all_data(files_structure_to_load)
@@ -155,7 +185,6 @@ def main():
     # --- FAZA 1: Trening Modeli Ogólnych (Generalist) ---
     print("\n" + "="*50); print("🤖 FAZA 1: Trening Modeli Ogólnych (Generalist)..."); print("="*50 + "\n")
     
-    # Używamy TRAIN_ON_SINGLE_TIMEFRAME = None, aby trenować na wszystkich interwałach
     training_data = get_combined_data_for_training(base_params, 
                                                  training_files_structure, 
                                                  data_store, 
@@ -168,32 +197,42 @@ def main():
     temp_exit_env = DummyVecEnv([lambda: ExitEnv(training_data, base_params)])
     
     if os.path.exists(entry_model_path): 
-        print(f"✅ Znaleziono model wejścia (Generalist). Ładowanie..."); 
-        entry_model = PPO.load(entry_model_path, env=temp_entry_env)
+        print(f"✅ Znaleziono model wejścia (Generalist). Ładowanie (na CPU)..."); 
+        # <<< ZMIANA: Ładujemy na CPU do backtestingu >>>
+        entry_model = PPO.load(entry_model_path, env=temp_entry_env, device="cpu")
     if entry_model is None: 
+        print("🤖 Model wejścia nie istnieje. Rozpoczynanie treningu...")
         entry_model = train_entry_manager(training_data, base_params, timesteps=50000, save_path=entry_model_path)
+        print("✅ Trening zakończony. Ładowanie modelu (na CPU) do backtestingu...")
+        # <<< ZMIANA: Ładujemy na CPU do backtestingu >>>
+        entry_model = PPO.load(entry_model_path, env=temp_entry_env, device="cpu")
     
     if os.path.exists(exit_model_path): 
-        print(f"✅ Znaleziono model wyjścia (Generalist). Ładowanie..."); 
-        exit_model = PPO.load(exit_model_path, env=temp_exit_env)
+        print(f"✅ Znaleziono model wyjścia (Generalist). Ładowanie (na CPU)..."); 
+        # <<< ZMIANA: Ładujemy na CPU do backtestingu >>>
+        exit_model = PPO.load(exit_model_path, env=temp_exit_env, device="cpu")
     if exit_model is None: 
+        print("🤖 Model wyjścia nie istnieje. Rozpoczynanie treningu...")
         exit_model = train_exit_manager(training_data, base_params, timesteps=75000, save_path=exit_model_path)
+        print("✅ Trening zakończony. Ładowanie modelu (na CPU) do backtestingu...")
+        # <<< ZMIANA: Ładujemy na CPU do backtestingu >>>
+        exit_model = PPO.load(exit_model_path, env=temp_exit_env, device="cpu")
     
     if not all([entry_model, exit_model]): print("Krytyczny błąd: Nie udało się przygotować modeli AI."); return
 
     all_timeframes = sorted(list(set(tf for tfs in files_structure.values() for tf in tfs)))
     
-    # Przekazujemy załadowane modele "Generalist" do Optuny
     init_backtester_worker(data_store)
     
     # --- FAZA 2: Optymalizacja Parametrów (Optuna) ---
-    print("\n" + "="*50); print("🚀 FAZA 2: Rozpoczynanie pętli optymalizacji (używa modeli 'Generalist')."); print("💡 Wciśnij 'q', aby zakończyć i przejść do dostrajania (Fazy 3)."); print("="*50 + "\n")
+    print("\n" + "="*50); print("🚀 FAZA 2: Rozpoczynanie pętli optymalizacji (używa modeli 'Generalist' na CPU)."); print("="*50 + "\n")
     
     cycle_num = 1
     try:
         while True:
             print(f"\n--- Cykl {cycle_num} ---")
             for timeframe in all_timeframes:
+                # <<< ZMIANA: Usunięto 'keyboard.is_pressed' >>>
                 print(f"\n--- Interwał: {timeframe} ---")
                 pairs_for_timeframe = [p for p, tfs in files_structure.items() if timeframe in tfs and p in testing_tickers]
                 if not pairs_for_timeframe: 
@@ -205,12 +244,11 @@ def main():
             cycle_num += 1; time.sleep(5)
             
     except KeyboardInterrupt:
-        print("\nPrzerwano pętlę optymalizacji. Przechodzenie do Fazy 3: Dostrajanie...")
+        print("\nPrzerwano pętlę optymalizacji (Ctrl+C). Przechodzenie do Fazy 3: Dostrajanie...")
     
     # --- FAZA 3: Dostrajanie (Fine-Tuning) Modeli ---
     print("\n" + "="*50); print("🤖 FAZA 3: Rozpoczynanie dostrajania modeli specjalistycznych..."); print("="*50 + "\n")
     
-    # Definiujemy, jak bardzo "dostroić" modele
     FINE_TUNE_TIMESTEPS_ENTRY = 25000
     FINE_TUNE_TIMESTEPS_EXIT = 35000 
     
@@ -218,24 +256,21 @@ def main():
         print(f"\n--- Dostrajanie dla interwału: {timeframe} ---")
         
         try:
-            # 1. Załaduj najlepsze parametry z Optuny
             study_name = f"study_{timeframe}_group_exit_manager"
             storage_name = f"sqlite:///{SCRIPT_DIR / study_name}.db"
             study = optuna.load_study(study_name=study_name, storage=storage_name)
             best_params_from_study = study.best_params
             
-            # Łączymy bazowe z najlepszymi (aby mieć pewność, że wszystkie klucze są)
             current_params = {**base_params, **best_params_from_study}
 
             print(f"  -> Znaleziono najlepsze parametry: {best_params_from_study}")
 
-            # 2. Przygotuj specjalistyczne dane treningowe
             print(f"  -> Przygotowywanie specjalistycznych danych dla {timeframe}...")
             specialist_data = get_combined_data_for_training(
                 current_params,
-                training_files_structure, # Używamy danych treningowych
+                training_files_structure, 
                 data_store, 
-                target_timeframe=timeframe # Kluczowa zmiana
+                target_timeframe=timeframe
             )
             
             if specialist_data.empty:
@@ -243,21 +278,22 @@ def main():
                 continue
             
             # 3. Dostrój i zapisz model WEJŚCIA
-            print(f"  -> Dostrajam model WEJŚCIA (Generalist)...")
-            # Używamy 'specialist_data' i 'current_params' do stworzenia env dla .learn()
+            print(f"  -> Dostrajam model WEJŚCIA (Generalist) -> (na GPU)...")
             specialist_entry_env = DummyVecEnv([lambda: EntryEnv(specialist_data, current_params)])
-            entry_model_generalist = PPO.load(entry_model_path, env=specialist_entry_env) # Ładujemy "Generalist"
-            entry_model_generalist.learn(total_timesteps=FINE_TUNE_TIMESTEPS_ENTRY) # Trenujemy dalej
+            # <<< BEZ ZMIAN: Ładujemy na GPU (domyślnie) do treningu >>>
+            entry_model_generalist = PPO.load(entry_model_path, env=specialist_entry_env) 
+            entry_model_generalist.learn(total_timesteps=FINE_TUNE_TIMESTEPS_ENTRY) # Trenujemy dalej (na GPU)
             
             specialist_entry_path = models_dir / f"ai_entry_strategist_model_specialist_{timeframe}.zip"
             entry_model_generalist.save(specialist_entry_path)
             print(f"  -> ✅ Zapisano model wejścia: {specialist_entry_path.name}")
 
             # 4. Dostrój i zapisz model WYJŚCIA
-            print(f"  -> Dostrajam model WYJŚCIA (Generalist)...")
+            print(f"  -> Dostrajam model WYJŚCIA (Generalist) -> (na GPU)...")
             specialist_exit_env = DummyVecEnv([lambda: ExitEnv(specialist_data, current_params)])
-            exit_model_generalist = PPO.load(exit_model_path, env=specialist_exit_env) # Ładujemy "Generalist"
-            exit_model_generalist.learn(total_timesteps=FINE_TUNE_TIMESTEPS_EXIT) # Trenujemy dalej
+            # <<< BEZ ZMIAN: Ładujemy na GPU (domyślnie) do treningu >>>
+            exit_model_generalist = PPO.load(exit_model_path, env=specialist_exit_env) 
+            exit_model_generalist.learn(total_timesteps=FINE_TUNE_TIMESTEPS_EXIT) # Trenujemy dalej (na GPU)
 
             specialist_exit_path = models_dir / f"ai_exit_manager_model_specialist_{timeframe}.zip"
             exit_model_generalist.save(specialist_exit_path)
@@ -278,13 +314,11 @@ def main():
             print(f"\n--- Analiza końcowa dla: {timeframe} ---")
             
             try:
-                # 1. Załaduj najlepsze parametry (te same co w Fazie 3)
                 study_name = f"study_{timeframe}_group_exit_manager"
                 storage_name = f"sqlite:///{SCRIPT_DIR / study_name}.db"
                 study = optuna.load_study(study_name=study_name, storage=storage_name)
                 best_params = study.best_params
                 
-                # 2. Załaduj modele SPECJALISTYCZNE
                 specialist_entry_path = models_dir / f"ai_entry_strategist_model_specialist_{timeframe}.zip"
                 specialist_exit_path = models_dir / f"ai_exit_manager_model_specialist_{timeframe}.zip"
 
@@ -292,23 +326,21 @@ def main():
                     print(f"  -> OSTRZEŻENIE: Brak modeli specjalistycznych dla {timeframe}. Pomijanie analizy.")
                     continue
                     
-                print(f"  -> Ładowanie modeli specjalistycznych dla {timeframe}...")
+                print(f"  -> Ładowanie modeli specjalistycznych dla {timeframe} (na CPU)...")
                 
-                # Używamy 'temp_entry_env' i 'temp_exit_env' z Fazy 1 do ładowania.
-                # Zapewniają one poprawny *kształt* przestrzeni.
-                entry_model_specialist = PPO.load(specialist_entry_path, env=temp_entry_env)
-                exit_model_specialist = PPO.load(specialist_exit_path, env=temp_exit_env)
+                # <<< ZMIANA: Ładujemy na CPU do backtestingu >>>
+                entry_model_specialist = PPO.load(specialist_entry_path, env=temp_entry_env, device="cpu")
+                exit_model_specialist = PPO.load(specialist_exit_path, env=temp_exit_env, device="cpu")
                 
-                print(f"  -> Uruchamianie symulacji na grupie testowej (z modelami specjalistycznymi)...")
+                print(f"  -> Uruchamianie symulacji na grupie testowej (z modelami specjalistycznymi na CPU)...")
                 
-                # 3. Uruchom symulację na grupie TESTOWEJ z parą (Best Params + Specialist Model)
                 for pair in pairs_for_timeframe:
                     sim_result = run_simulation(
                         best_params, 
                         pair, 
                         timeframe, 
-                        entry_model_specialist,  # Użyj modelu specjalisty
-                        exit_model_specialist    # Użyj modelu specjalisty
+                        entry_model_specialist,  
+                        exit_model_specialist    
                     )
                     all_trades_list.extend(sim_result['trades'])
                     
@@ -335,7 +367,6 @@ def main():
         results_df.loc[longs, 'PnL'] = ((results_df['exit_price'] - results_df['avg_price']) / results_df['avg_price']) * 100
         results_df.loc[shorts, 'PnL'] = ((results_df['avg_price'] - results_df['exit_price']) / results_df['avg_price']) * 100
         
-        # Przekazujemy pełny DataFrame (z pojedynczymi transakcjami) ORAZ market_caps
         analyze_by_market_cap(results_df, market_caps)
 
     except Exception as e:
@@ -344,4 +375,3 @@ def main():
 if __name__ == "__main__":
     multiprocessing.freeze_support()
     main()
-
