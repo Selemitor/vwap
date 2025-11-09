@@ -157,7 +157,7 @@ def main():
     num_training = 100
     training_tickers = sorted_tickers[:num_training]
 
-    num_testing = 100
+    num_testing = 50
     testing_tickers = sorted_tickers[num_training : num_training + num_testing]
 
     if not testing_tickers:
@@ -202,7 +202,7 @@ def main():
         entry_model = PPO.load(entry_model_path, env=temp_entry_env, device="cpu")
     if entry_model is None: 
         print("🤖 Model wejścia nie istnieje. Rozpoczynanie treningu...")
-        entry_model = train_entry_manager(training_data, base_params, timesteps=50000, save_path=entry_model_path)
+        entry_model = train_entry_manager(training_data, base_params, timesteps=500000, save_path=entry_model_path)
         print("✅ Trening zakończony. Ładowanie modelu (na CPU) do backtestingu...")
         # <<< ZMIANA: Ładujemy na CPU do backtestingu >>>
         entry_model = PPO.load(entry_model_path, env=temp_entry_env, device="cpu")
@@ -213,7 +213,7 @@ def main():
         exit_model = PPO.load(exit_model_path, env=temp_exit_env, device="cpu")
     if exit_model is None: 
         print("🤖 Model wyjścia nie istnieje. Rozpoczynanie treningu...")
-        exit_model = train_exit_manager(training_data, base_params, timesteps=75000, save_path=exit_model_path)
+        exit_model = train_exit_manager(training_data, base_params, timesteps=500000, save_path=exit_model_path)
         print("✅ Trening zakończony. Ładowanie modelu (na CPU) do backtestingu...")
         # <<< ZMIANA: Ładujemy na CPU do backtestingu >>>
         exit_model = PPO.load(exit_model_path, env=temp_exit_env, device="cpu")
@@ -222,17 +222,19 @@ def main():
 
     all_timeframes = sorted(list(set(tf for tfs in files_structure.values() for tf in tfs)))
     
+    # Przekazujemy załadowane modele "Generalist" do Optuny
     init_backtester_worker(data_store)
     
     # --- FAZA 2: Optymalizacja Parametrów (Optuna) ---
     print("\n" + "="*50); print("🚀 FAZA 2: Rozpoczynanie pętli optymalizacji (używa modeli 'Generalist' na CPU)."); print("="*50 + "\n")
     
-    cycle_num = 1
+    MAX_OPTUNA_CYCLES = 10 # <<< NOWA STAŁA: Limit cykli dla fazy Optuny (Faza 2) >>>
+    
     try:
-        while True:
-            print(f"\n--- Cykl {cycle_num} ---")
+        cycle_num = 0
+        while cycle_num < MAX_OPTUNA_CYCLES: # Zmieniamy na limit
+            print(f"\n====================== CYKL OPTUNY: {cycle_num + 1} z {MAX_OPTUNA_CYCLES} ======================")
             for timeframe in all_timeframes:
-                # <<< ZMIANA: Usunięto 'keyboard.is_pressed' >>>
                 print(f"\n--- Interwał: {timeframe} ---")
                 pairs_for_timeframe = [p for p, tfs in files_structure.items() if timeframe in tfs and p in testing_tickers]
                 if not pairs_for_timeframe: 
@@ -241,16 +243,19 @@ def main():
                 
                 # Optuna używa modeli "Generalist"
                 optimize_timeframe_group(entry_model, exit_model, pairs_for_timeframe, timeframe, n_trials=10, storage_dir=SCRIPT_DIR)
-            cycle_num += 1; time.sleep(5)
+            cycle_num += 1
+            time.sleep(5)
             
+        print("\n✅ Osiągnięto limit cykli Optuny. Automatyczne przechodzenie do Fazy 3: Dostrajanie.") # Nowy komunikat
+        
     except KeyboardInterrupt:
-        print("\nPrzerwano pętlę optymalizacji (Ctrl+C). Przechodzenie do Fazy 3: Dostrajanie...")
+        print("\nPrzerwano pętlę optymalizacji (Ctrl+C). Przechodzenie do Fazy 3: Dostrajanie.")
     
     # --- FAZA 3: Dostrajanie (Fine-Tuning) Modeli ---
     print("\n" + "="*50); print("🤖 FAZA 3: Rozpoczynanie dostrajania modeli specjalistycznych..."); print("="*50 + "\n")
     
-    FINE_TUNE_TIMESTEPS_ENTRY = 25000
-    FINE_TUNE_TIMESTEPS_EXIT = 35000 
+    FINE_TUNE_TIMESTEPS_ENTRY = 250000
+    FINE_TUNE_TIMESTEPS_EXIT = 250000 
     
     for timeframe in all_timeframes:
         print(f"\n--- Dostrajanie dla interwału: {timeframe} ---")
@@ -280,7 +285,6 @@ def main():
             # 3. Dostrój i zapisz model WEJŚCIA
             print(f"  -> Dostrajam model WEJŚCIA (Generalist) -> (na GPU)...")
             specialist_entry_env = DummyVecEnv([lambda: EntryEnv(specialist_data, current_params)])
-            # <<< BEZ ZMIAN: Ładujemy na GPU (domyślnie) do treningu >>>
             entry_model_generalist = PPO.load(entry_model_path, env=specialist_entry_env) 
             entry_model_generalist.learn(total_timesteps=FINE_TUNE_TIMESTEPS_ENTRY) # Trenujemy dalej (na GPU)
             
@@ -291,7 +295,6 @@ def main():
             # 4. Dostrój i zapisz model WYJŚCIA
             print(f"  -> Dostrajam model WYJŚCIA (Generalist) -> (na GPU)...")
             specialist_exit_env = DummyVecEnv([lambda: ExitEnv(specialist_data, current_params)])
-            # <<< BEZ ZMIAN: Ładujemy na GPU (domyślnie) do treningu >>>
             exit_model_generalist = PPO.load(exit_model_path, env=specialist_exit_env) 
             exit_model_generalist.learn(total_timesteps=FINE_TUNE_TIMESTEPS_EXIT) # Trenujemy dalej (na GPU)
 
@@ -328,7 +331,6 @@ def main():
                     
                 print(f"  -> Ładowanie modeli specjalistycznych dla {timeframe} (na CPU)...")
                 
-                # <<< ZMIANA: Ładujemy na CPU do backtestingu >>>
                 entry_model_specialist = PPO.load(specialist_entry_path, env=temp_entry_env, device="cpu")
                 exit_model_specialist = PPO.load(specialist_exit_path, env=temp_exit_env, device="cpu")
                 
@@ -375,4 +377,3 @@ def main():
 if __name__ == "__main__":
     multiprocessing.freeze_support()
     main()
-
