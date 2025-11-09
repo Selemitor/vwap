@@ -257,7 +257,7 @@ def main():
         
         try:
             study_name = f"study_{timeframe}_group_exit_manager"
-            storage_name = f"sqlite:///{SCRIPT_DIR / study_name}.db"
+            storage_name = "postgresql://postgres:twojehaslo@localhost:5432/optuna_db"
             study = optuna.load_study(study_name=study_name, storage=storage_name)
             best_params_from_study = study.best_params
             
@@ -315,7 +315,7 @@ def main():
             
             try:
                 study_name = f"study_{timeframe}_group_exit_manager"
-                storage_name = f"sqlite:///{SCRIPT_DIR / study_name}.db"
+                storage_name = "postgresql://postgres:twojehaslo@localhost:5432/optuna_db"
                 study = optuna.load_study(study_name=study_name, storage=storage_name)
                 best_params = study.best_params
                 
@@ -375,3 +375,4 @@ def main():
 if __name__ == "__main__":
     multiprocessing.freeze_support()
     main()
+
