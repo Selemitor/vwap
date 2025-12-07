@@ -3,8 +3,8 @@ import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
 import pandas as pd
-from stable_baselines3 import PPO
-# <<< POPRAWKA: Importujemy obie funkcje >>>
+# ZMIANA: Importujemy RecurrentPPO z sb3-contrib
+from sb3_contrib import RecurrentPPO 
 from indicators import add_atr, add_trendline_features, add_temporal_features
 
 class TradeManagerEnv(gym.Env):
@@ -33,8 +33,8 @@ class TradeManagerEnv(gym.Env):
         self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(self.lookback_window, self.num_features), dtype=np.float32)
         
         self.action_space = spaces.Box(
-            low=np.array([0.0, 0.7, 0.7]),
-            high=np.array([1.0, 2.0, 3.0]),
+            low=np.array([-1.0, 0.7, 0.7]),  # Pierwsza wartość: -1 (Short) do 1 (Long)
+            high=np.array([1.0, 2.0, 3.0]),  # SL i RR bez zmian
             dtype=np.float32
         )
         
@@ -80,35 +80,43 @@ class TradeManagerEnv(gym.Env):
         
         # <<< POPRAWKA: Łączymy wszystkie 4 grupy cech >>>
         final_obs = np.hstack([obs_original, obs_trendline, obs_temporal, obs_last_pnl])
-        return np.nan_to_num(final_obs.astype(np.float32))
+        final_obs = np.nan_to_num(final_obs) # Najpierw NaN na 0
+        final_obs = np.clip(final_obs, -10.0, 10.0) # Potem ucinamy ekstrema
+        
+        return final_obs.astype(np.float32)
 
     def step(self, action):
-        confirm, sl_mult, rr_mult = action
+        signal_val, sl_mult, rr_mult = action
         
         entry_row_index = self.current_step + self.lookback_window
         if entry_row_index >= len(self.df):
-            self.current_step += 1
             done = True
             return self._next_observation(), 0, done, False, {}
-            
-        entry_row = self.df.iloc[entry_row_index]
-        
-        if pd.isna(entry_row['close']) or pd.isna(entry_row['signal_ema']):
-            self.current_step += 1
-            done = self.current_step >= self.max_steps
-            return self._next_observation(), 0, done, False, {}
-            
-        side = 'long' if entry_row['close'] < entry_row['signal_ema'] else 'short'
-        
+
         real_outcome = 0
-        if confirm > 0.5:
-            real_outcome = self._simulate_trade(entry_row_index, side, sl_mult, rr_mult)
-        else:
-            real_outcome = -self._simulate_trade(entry_row_index, side, 1.0, 1.0)
         
+        # --- TRYB PRODUKCYJNY: CZYSTA DECYZJA AI ---
+        # Ustawiamy próg pewności (Confidence Threshold). 
+        # 0.3 oznacza, że AI musi być dość pewne swego (-1 do 1).
+        threshold = 0.3 
+        
+        if signal_val > threshold:
+            # AI zdecydowało: LONG
+            real_outcome = self._simulate_trade(entry_row_index, 'long', sl_mult, rr_mult)
+            
+        elif signal_val < -threshold:
+            # AI zdecydowało: SHORT
+            real_outcome = self._simulate_trade(entry_row_index, 'short', sl_mult, rr_mult)
+            
+        else:
+            # AI CZEKA (Strefa niepewności)
+            # Utrzymujemy karę za bierność, aby AI szukało okazji, a nie spało.
+            real_outcome = -0.02 
+            
         self.last_trade_pnl = real_outcome
         self.current_step += 1
         done = self.current_step >= self.max_steps
+        
         return self._next_observation(), real_outcome, done, False, {}
 
     def _simulate_trade(self, entry_step_index, side, sl_mult, rr_mult):
@@ -147,11 +155,13 @@ class TradeManagerEnv(gym.Env):
         return np.clip(pnl * 10, -1, 1)
 
 def train_ai_manager(df, params, timesteps=50000, save_path="ai_entry_strategist_model.zip"):
-    # <<< POPRAWKA: Zmieniony komunikat >>>
-    print("🤖 Rozpoczynanie treningu Agenta AI (Wejście, 17 cech)...")
+    print("🧠 Rozpoczynanie treningu Agenta AI (Wejście, LSTM + 17 cech)...")
     env = TradeManagerEnv(df, params)
-    model = PPO("MlpPolicy", env, verbose=0)
+    
+    # ZMIANA: Używamy RecurrentPPO z polityką LSTM (MlpLstmPolicy)
+    model = RecurrentPPO("MlpLstmPolicy", env, verbose=1, ent_coef=0.05)
+    
     model.learn(total_timesteps=timesteps)
     model.save(save_path)
-    print(f"✅ Trening zakończony. Model '{save_path}' jest gotowy do użytku.")
+    print(f"✅ Trening LSTM zakończony. Model '{save_path}' gotowy.")
     return model
