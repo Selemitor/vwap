@@ -1,6 +1,8 @@
 # analysis.py
 import pandas as pd
 import numpy as np
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import os
 import re # Dodano import do czyszczenia nazw plików
@@ -109,3 +111,4 @@ def analyze_by_market_cap(results_df, mcap_data):
     print(final_report)
     final_report.to_csv("full_performance_report.csv")
     print("\n✅ Rozszerzony raport zapisany.")
+
