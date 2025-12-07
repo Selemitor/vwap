@@ -1,378 +1,263 @@
-# mainv3.py
+import sys
+import time
+import logging
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("main_script_log.log", encoding='utf-8'),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+
 import multiprocessing
 import pandas as pd
 import numpy as np
 import os
-import time
 import random
 import optuna
-import random
 from pathlib import Path
-from indicators import add_rsi, add_wave_trend, add_trendline_features, add_atr, add_temporal_features
 
+# Importy
+from indicators import add_rsi, add_wave_trend, add_trendline_features, add_atr, add_temporal_features
 from data_loader import discover_data_files, fetch_and_cache_market_caps, preload_all_data
 from backtester import optimize_timeframe_group, init_backtester_worker, run_simulation
 from analysis import analyze_by_market_cap
 from ai_manager import TradeManagerEnv as EntryEnv, train_ai_manager as train_entry_manager
 from exit_manager import ExitManagerEnv as ExitEnv, train_exit_manager
 
-from stable_baselines3 import PPO
+# ZMIANA: Importujemy RecurrentPPO zamiast PPO
+from sb3_contrib import RecurrentPPO
 from stable_baselines3.common.vec_env import DummyVecEnv
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 
-# --- Definicje funkcji (pozostają bez zmian) ---
+# --- Funkcje pomocnicze (precompute & get_data) ---
+
+def precompute_heavy_indicators(df):
+    if 'day_sin' not in df.columns: df = add_temporal_features(df)
+    if 'atr' not in df.columns:
+        df = add_atr(df, period=14)
+        df['atr_norm'] = df['atr'] / df['close']
+    if 'price_change' not in df.columns:
+        df['price_change'] = np.log(df['close'] / df['close'].shift(1))
+    if 'adx' not in df.columns: df = add_trendline_features(df, lookback=72)
+    if 'tp_calc' not in df.columns:
+        df['tp_calc'] = (df['high'] + df['low'] + df['close']) / 3
+        df['tp_vol'] = df['tp_calc'] * df['volume']
+        df['month'] = df.index.to_period('M')
+    df.ffill(inplace=True); df.bfill(inplace=True)
+    return df
 
 def get_combined_data_for_training(params, files_to_use, data_store, target_timeframe=None):
-    """
-    Przygotowuje i łączy dane do treningu, dodając wszystkie potrzebne wskaźniki.
-    """
-    
     MIN_BLOCK_SIZE_FOR_INDICATORS = 150 
     processed_df_list = []
-    all_dfs_raw = []
-    
-    if target_timeframe:
-        print(f"  -> Przygotowywanie danych treningowych TYLKO dla interwału: {target_timeframe}...")
-        for pair, timeframes in files_to_use.items():
-            if target_timeframe in timeframes and \
-               pair in data_store and \
-               target_timeframe in data_store[pair]:
-                
-                df_to_add = data_store[pair][target_timeframe].copy()
-                if len(df_to_add) >= MIN_BLOCK_SIZE_FOR_INDICATORS:
-                    all_dfs_raw.append(df_to_add)
-                else:
-                    print(f"  -> Pomijanie {pair} {target_timeframe} (zbyt mało danych: {len(df_to_add)})")
-    else:
-        print("  -> Tryb 'Wszystkie interwały'. Aktywowanie balansowania danych...")
-        for pair, timeframes in files_to_use.items():
+    candidates = []
+    for pair, timeframes in files_to_use.items():
+        if target_timeframe:
+            if target_timeframe in timeframes and target_timeframe in data_store[pair]:
+                candidates.append(data_store[pair][target_timeframe])
+        else:
             for tf in timeframes:
-                if pair in data_store and tf in data_store[pair]:
-                    if len(data_store[pair][tf]) >= MIN_BLOCK_SIZE_FOR_INDICATORS:
-                        all_dfs_raw.append(data_store[pair][tf].copy())
+                if tf in data_store[pair]: candidates.append(data_store[pair][tf])
+    if not candidates: return pd.DataFrame()
 
-    if not all_dfs_raw:
-        print("  -> BŁĄD: Nie znaleziono wystarczających danych do połączenia.")
-        return pd.DataFrame()
-
-    min_len = min(len(df) for df in all_dfs_raw)
+    min_len = min(len(df) for df in candidates if len(df) >= MIN_BLOCK_SIZE_FOR_INDICATORS)
     block_size = min_len
     
-    if not target_timeframe: # Stosuj balansowanie tylko w trybie "Wszystkie interwały"
-        print(f"  -> Balansowanie do najkrótszego zbioru: {block_size} świec (na interwał/parę).")
-
-    print("  -> Przetwarzanie bloków danych (Obliczanie wskaźników PRZED łączeniem)...")
-    
-    for df_original in all_dfs_raw:
-        df_block = None
-        if not target_timeframe: # Logika balansowania
-            if len(df_original) > block_size:
-                max_start_index = len(df_original) - block_size
-                start_index = random.randint(0, max_start_index)
-                df_block = df_original.iloc[start_index : start_index + block_size].copy()
-            else:
-                df_block = df_original.copy()
-        else: # Tryb jednego interwału - bierzemy wszystko
+    for df_original in candidates:
+        if len(df_original) < MIN_BLOCK_SIZE_FOR_INDICATORS: continue
+        if not target_timeframe and len(df_original) > block_size:
+            max_start = len(df_original) - block_size
+            start = random.randint(0, max_start)
+            df_block = df_original.iloc[start : start + block_size].copy()
+        else:
             df_block = df_original.copy()
 
-        df_block = add_temporal_features(df_block)
+        # Zabezpieczenie przed brakiem wskaźników statycznych
+        if 'adx' not in df_block.columns: df_block = precompute_heavy_indicators(df_block)
+        
+        # Wskaźniki dynamiczne (zależne od params Optuny)
         df_block = add_rsi(df_block, params.get("RSI_PERIOD", 14))
         df_block = add_wave_trend(df_block, params.get("WT_N1", 10), params.get("WT_N2", 21))
         df_block['ema_fast'] = df_block['close'].ewm(span=params["EMA_FAST"]).mean()
         df_block['ema_slow'] = df_block['close'].ewm(span=params["EMA_SLOW"]).mean()
-        df_block = add_atr(df_block, period=14) 
         df_block['price_change'] = df_block['close'].pct_change()
-        df_block['atr_norm'] = df_block['atr'] / df_block['close']
         df_block['signal_ema'] = df_block['close'].ewm(span=50).mean()
-        df_block = add_trendline_features(df_block, lookback=72)
         
         df_block.ffill(inplace=True); df_block.bfill(inplace=True)
         processed_df_list.append(df_block)
     
-    if not processed_df_list:
-        print("  -> BŁĄD: Nie znaleziono danych do połączenia (po balansowaniu).")
-        return pd.DataFrame()
-
+    if not processed_df_list: return pd.DataFrame()
     combined_df = pd.concat(processed_df_list)
     combined_df.sort_index(inplace=True)
-    
-    print(f"  -> Połączone dane mają teraz {len(combined_df)} wierszy.")
+    required_columns = ['close', 'ema_fast', 'ema_slow', 'RSI', 'WT1', 'WT2', 'res_slope_norm', 'day_sin']
+    return combined_df.dropna(subset=required_columns)
 
-    required_columns = ['close', 'ema_fast', 'ema_slow', 'RSI', 'WT1', 'WT2', 
-                        'res_slope_norm', 'day_sin', 'hour_sin']
-    
-    if not all(col in combined_df.columns for col in required_columns):
-        print("  -> OSTRZEŻENIE: Brak wymaganych kolumn po obliczeniu wskaźników.")
-        return pd.DataFrame()
-
-    cleaned_df = combined_df.dropna(subset=required_columns)
-
-    if cleaned_df.empty:
-        print("  -> KRYTYCZNY BŁĄD: Zbiór danych treningowych jest pusty PO czyszczeniu.")
-
-    print("  -> ✅ Dane treningowe gotowe.")
-    return cleaned_df
+# --- GŁÓWNA PĘTLA ---
 
 def main():
-    # --- Konfiguracja i ładowanie danych ---
+    logging.info("\n" + "="*80)
+    logging.info(f"START SYSTEMU (wersja LSTM + Split): {time.strftime('%Y-%m-%d %H:%M:%S')}")
+    logging.info("="*80 + "\n")
+
     files_structure_raw = discover_data_files() 
-
-    # --- NOWY BLOK: Filtracja Stablecoinów i Wrapped Tokens ---
-    print("🔍 Filtrowanie listy tickerów...")
-    # Lista bazowych walut stablecoinów do zignorowania
     STABLECOINS = ['USDT', 'USDC', 'DAI', 'TUSD', 'BUSD', 'FDUSD', 'USDP', 'PYUSD', 'PAX', 'GUSD', 'USDD', 'FRAX']
-    # Główne Wrapped Tokens
-    BLACKLISTED_BASE_CURRENCIES = STABLECOINS + [
-        'WBTC', 'WETH', 'WBNB', 'WAVAX', 'WMATIC', 'WFTM', 
-        'STETH', 'RETH', 'CBETH', 'CETH', 'CDAI', 'CUSDC', 'AXLUSDC', 'SOBTC'
-    ]
+    BLACKLISTED = STABLECOINS + ['WBTC', 'WETH', 'WBNB', 'WAVAX', 'WMATIC', 'WFTM', 'STETH']
 
-    files_structure = {} # Nowy, przefiltrowany słownik
-    
+    files_structure = {} 
     for ticker, timeframes in files_structure_raw.items():
-        try:
-            base_currency = ticker.split('_')[0].upper()
-            
-            if base_currency in BLACKLISTED_BASE_CURRENCIES:
-                continue
-                
-            # Jeśli przeszedł filtry, dodaj go
+        base = ticker.split('_')[0].upper()
+        if base not in BLACKLISTED:
             files_structure[ticker] = timeframes
-            
-        except Exception as e:
-            print(f"  -> Błąd filtrowania {ticker}: {e}")
     
-    print(f"✅ Przefiltrowano. Pozostało {len(files_structure)} z {len(files_structure_raw)} par.")
-    # --- KONIEC BLOKU FILTRACJI ---
-
     all_tickers = list(files_structure.keys())
     market_caps = fetch_and_cache_market_caps(all_tickers)
-    
     sorted_tickers = sorted(market_caps, key=market_caps.get, reverse=True)
-
-    # --- NOWA LOGIKA WYBORU GRUP ---
-    print(f"Łącznie posortowanych tickerów: {len(sorted_tickers)}")
-
-    num_training = 100
-    training_tickers = sorted_tickers[:num_training]
-
-    num_testing = 50
-    testing_tickers = sorted_tickers[num_training : num_training + num_testing]
-
-    if not testing_tickers:
-        print("OSTRZEŻENIE: Brak tickerów w grupie testowej (101-200). Używam reszty tickerów.")
-        testing_tickers = sorted_tickers[num_training:]
-    # --- KONIEC NOWEJ LOGIKI ---
-        
-    print("\n" + "="*50); print(f"📊 Podział na grupy:"); print(f"  -> Grupa Treningowa (TOP {num_training} MCap): {len(training_tickers)} par"); print(f"  -> Grupa Testowa (Miejsca 101-{101+num_testing}): {len(testing_tickers)} par"); print("="*50)
+    #sorted_tickers = sorted_tickers[:20] # Ograniczenie do 20 par
     
-    tickers_to_load = list(set(training_tickers + testing_tickers)); files_structure_to_load = {k: v for k, v in files_structure.items() if k in tickers_to_load}
-    print(f"\nŁącznie zostanie wczytanych {len(tickers_to_load)} par (treningowe + testowe)."); data_store = preload_all_data(files_structure_to_load)
+    # <<< Podział na 3 zbiory (Train, Validation, Test) >>>
+    n_total = len(sorted_tickers)
+    n_train = int(n_total * 0.60) # 60%
+    n_val = int(n_total * 0.20)   # 20%
+    # Reszta (20%) na test
+    
+    training_tickers = sorted_tickers[:n_train]
+    validation_tickers = sorted_tickers[n_train : n_train + n_val]
+    testing_tickers = sorted_tickers[n_train + n_val:]
+    
+    logging.info(f"📊 Podział danych: Train={len(training_tickers)}, Val={len(validation_tickers)}, Test={len(testing_tickers)}")
+
+    tickers_to_load = list(set(training_tickers + validation_tickers + testing_tickers))
+    files_to_load = {k: v for k, v in files_structure.items() if k in tickers_to_load}
+    
+    # Ładowanie i pre-kalkulacja
+    data_store = preload_all_data(files_to_load)
+
+    logging.info("⚡ Pre-kalkulacja wskaźników...")
+    count = 0
+    for pair in data_store:
+        for tf in data_store[pair]:
+            data_store[pair][tf] = precompute_heavy_indicators(data_store[pair][tf])
+            count += 1
+    logging.info(f"✅ Pre-kalkulacja gotowa.")
 
     base_params = {"SL_PCT": 0.05, "TRADE_DIRECTION": "both", "EMA_FAST": 12, "EMA_SLOW": 26, "RSI_PERIOD": 14, "WT_N1": 10, "WT_N2": 21, "USE_EMA": False}
-    training_files_structure = {k: v for k, v in files_structure.items() if k in training_tickers}
     
-    models_dir = SCRIPT_DIR / "Models"; models_dir.mkdir(exist_ok=True)
+    # Pliki dla treningu generalisty
+    training_files = {k: v for k, v in files_structure.items() if k in training_tickers}
     
-    # Nazwy modeli "Generalist"
-    model_suffix = "_combined"
-    entry_model_path = models_dir / f"ai_entry_strategist_model{model_suffix}.zip"
-    exit_model_path = models_dir / f"ai_exit_manager_model{model_suffix}.zip"
+    models_dir = SCRIPT_DIR / "Models"
+    models_dir.mkdir(exist_ok=True)
     
-    entry_model, exit_model = None, None
+    entry_model_path = models_dir / "ai_entry_lstm_model.zip"
+    exit_model_path = models_dir / "ai_exit_lstm_model.zip"
     
-    # --- FAZA 1: Trening Modeli Ogólnych (Generalist) ---
-    print("\n" + "="*50); print("🤖 FAZA 1: Trening Modeli Ogólnych (Generalist)..."); print("="*50 + "\n")
+    # --- FAZA 1: Ciągły Trening (Incremental Learning) ---
+    logging.info("🤖 FAZA 1: Trening / Douczanie Modeli LSTM...")
     
-    training_data = get_combined_data_for_training(base_params, 
-                                                 training_files_structure, 
-                                                 data_store, 
-                                                 target_timeframe=None)
-    
-    if training_data.empty: print("Krytyczny błąd: Brak danych do treningu."); return
-    
-    # Tworzymy env, które będą używane do ładowania modeli
+    # KROK 1: Pobranie danych treningowych
+    training_data = get_combined_data_for_training(base_params, training_files, data_store)
+    if training_data.empty: 
+        logging.error("Brak danych treningowych."); return
+
+    # KROK 2: Inicjalizacja środowisk (MUSI BYĆ PRZED LOAD)
     temp_entry_env = DummyVecEnv([lambda: EntryEnv(training_data, base_params)])
     temp_exit_env = DummyVecEnv([lambda: ExitEnv(training_data, base_params)])
-    
-    if os.path.exists(entry_model_path): 
-        print(f"✅ Znaleziono model wejścia (Generalist). Ładowanie (na CPU)..."); 
-        # <<< ZMIANA: Ładujemy na CPU do backtestingu >>>
-        entry_model = PPO.load(entry_model_path, env=temp_entry_env, device="cpu")
-    if entry_model is None: 
-        print("🤖 Model wejścia nie istnieje. Rozpoczynanie treningu...")
-        entry_model = train_entry_manager(training_data, base_params, timesteps=500000, save_path=entry_model_path)
-        print("✅ Trening zakończony. Ładowanie modelu (na CPU) do backtestingu...")
-        # <<< ZMIANA: Ładujemy na CPU do backtestingu >>>
-        entry_model = PPO.load(entry_model_path, env=temp_entry_env, device="cpu")
-    
-    if os.path.exists(exit_model_path): 
-        print(f"✅ Znaleziono model wyjścia (Generalist). Ładowanie (na CPU)..."); 
-        # <<< ZMIANA: Ładujemy na CPU do backtestingu >>>
-        exit_model = PPO.load(exit_model_path, env=temp_exit_env, device="cpu")
-    if exit_model is None: 
-        print("🤖 Model wyjścia nie istnieje. Rozpoczynanie treningu...")
-        exit_model = train_exit_manager(training_data, base_params, timesteps=500000, save_path=exit_model_path)
-        print("✅ Trening zakończony. Ładowanie modelu (na CPU) do backtestingu...")
-        # <<< ZMIANA: Ładujemy na CPU do backtestingu >>>
-        exit_model = PPO.load(exit_model_path, env=temp_exit_env, device="cpu")
-    
-    if not all([entry_model, exit_model]): print("Krytyczny błąd: Nie udało się przygotować modeli AI."); return
 
+    # KROK 3: Ładowanie lub tworzenie modeli
+    # --- 1. ENTRY MODEL (WEJŚCIE) ---
+    if entry_model_path.exists():
+        logging.info("🔄 Wczytywanie istniejącego modelu Entry... DOUCZANIE.")
+        # Wczytujemy stary model do istniejącego env
+        entry_model = RecurrentPPO.load(entry_model_path, env=temp_entry_env, device="cpu", ent_coef=0.05) 
+    else:
+        logging.info("✨ Tworzenie nowego modelu Entry od zera...")
+        # Tworzymy nowy model
+        entry_model = RecurrentPPO("MlpLstmPolicy", temp_entry_env, verbose=1, ent_coef=0.05, device="cpu")
+
+    # TRENUJEMY (Niezależnie czy stary czy nowy)
+    entry_model.learn(total_timesteps=5000) 
+    entry_model.save(entry_model_path)
+    logging.info("✅ Model Entry zapisany po treningu.")
+
+    # --- 2. EXIT MODEL (WYJŚCIE) ---
+    if exit_model_path.exists():
+        logging.info("🔄 Wczytywanie istniejącego modelu Exit... DOUCZANIE.")
+        exit_model = RecurrentPPO.load(exit_model_path, env=temp_exit_env, device="cpu", ent_coef=0.05)
+    else:
+        logging.info("✨ Tworzenie nowego modelu Exit od zera...")
+        exit_model = RecurrentPPO("MlpLstmPolicy", temp_exit_env, verbose=1, ent_coef=0.05, device="cpu")
+
+    exit_model.learn(total_timesteps=5000)
+    exit_model.save(exit_model_path)
+    logging.info("✅ Model Exit zapisany po treningu.")
+    
+    init_backtester_worker(data_store)
+
+    # --- FAZA 2: Optymalizacja (Optuna) na zbiorze VALIDATION ---
+    logging.info("🚀 FAZA 2: Optymalizacja parametrów (Zbiór Walidacyjny)...")
     all_timeframes = sorted(list(set(tf for tfs in files_structure.values() for tf in tfs)))
     
-    # Przekazujemy załadowane modele "Generalist" do Optuny
-    init_backtester_worker(data_store)
-    
-    # --- FAZA 2: Optymalizacja Parametrów (Optuna) ---
-    print("\n" + "="*50); print("🚀 FAZA 2: Rozpoczynanie pętli optymalizacji (używa modeli 'Generalist' na CPU)."); print("="*50 + "\n")
-    
-    MAX_OPTUNA_CYCLES = 10 # <<< NOWA STAŁA: Limit cykli dla fazy Optuny (Faza 2) >>>
-    
-    try:
-        cycle_num = 0
-        while cycle_num < MAX_OPTUNA_CYCLES: # Zmieniamy na limit
-            print(f"\n====================== CYKL OPTUNY: {cycle_num + 1} z {MAX_OPTUNA_CYCLES} ======================")
-            for timeframe in all_timeframes:
-                print(f"\n--- Interwał: {timeframe} ---")
-                pairs_for_timeframe = [p for p, tfs in files_structure.items() if timeframe in tfs and p in testing_tickers]
-                if not pairs_for_timeframe: 
-                    print(f"Brak par z losowej grupy testowej dla interwału {timeframe}.")
-                    continue
-                
-                # Optuna używa modeli "Generalist"
-                optimize_timeframe_group(entry_model, exit_model, pairs_for_timeframe, timeframe, n_trials=10, storage_dir=SCRIPT_DIR)
-            cycle_num += 1
-            time.sleep(5)
-            
-        print("\n✅ Osiągnięto limit cykli Optuny. Automatyczne przechodzenie do Fazy 3: Dostrajanie.") # Nowy komunikat
-        
-    except KeyboardInterrupt:
-        print("\nPrzerwano pętlę optymalizacji (Ctrl+C). Przechodzenie do Fazy 3: Dostrajanie.")
-    
-    # --- FAZA 3: Dostrajanie (Fine-Tuning) Modeli ---
-    print("\n" + "="*50); print("🤖 FAZA 3: Rozpoczynanie dostrajania modeli specjalistycznych..."); print("="*50 + "\n")
-    
-    FINE_TUNE_TIMESTEPS_ENTRY = 250000
-    FINE_TUNE_TIMESTEPS_EXIT = 250000 
-    
-    for timeframe in all_timeframes:
-        print(f"\n--- Dostrajanie dla interwału: {timeframe} ---")
-        
-        try:
-            study_name = f"study_{timeframe}_group_exit_manager"
-            storage_name = "postgresql://postgres:twojehaslo@localhost:5432/optuna_db"
-            study = optuna.load_study(study_name=study_name, storage=storage_name)
-            best_params_from_study = study.best_params
-            
-            current_params = {**base_params, **best_params_from_study}
-
-            print(f"  -> Znaleziono najlepsze parametry: {best_params_from_study}")
-
-            print(f"  -> Przygotowywanie specjalistycznych danych dla {timeframe}...")
-            specialist_data = get_combined_data_for_training(
-                current_params,
-                training_files_structure, 
-                data_store, 
-                target_timeframe=timeframe
-            )
-            
-            if specialist_data.empty:
-                print(f"  -> BŁĄD: Brak danych do dostrojenia dla {timeframe}. Pomijanie.")
-                continue
-            
-            # 3. Dostrój i zapisz model WEJŚCIA
-            print(f"  -> Dostrajam model WEJŚCIA (Generalist) -> (na GPU)...")
-            specialist_entry_env = DummyVecEnv([lambda: EntryEnv(specialist_data, current_params)])
-            entry_model_generalist = PPO.load(entry_model_path, env=specialist_entry_env) 
-            entry_model_generalist.learn(total_timesteps=FINE_TUNE_TIMESTEPS_ENTRY) # Trenujemy dalej (na GPU)
-            
-            specialist_entry_path = models_dir / f"ai_entry_strategist_model_specialist_{timeframe}.zip"
-            entry_model_generalist.save(specialist_entry_path)
-            print(f"  -> ✅ Zapisano model wejścia: {specialist_entry_path.name}")
-
-            # 4. Dostrój i zapisz model WYJŚCIA
-            print(f"  -> Dostrajam model WYJŚCIA (Generalist) -> (na GPU)...")
-            specialist_exit_env = DummyVecEnv([lambda: ExitEnv(specialist_data, current_params)])
-            exit_model_generalist = PPO.load(exit_model_path, env=specialist_exit_env) 
-            exit_model_generalist.learn(total_timesteps=FINE_TUNE_TIMESTEPS_EXIT) # Trenujemy dalej (na GPU)
-
-            specialist_exit_path = models_dir / f"ai_exit_manager_model_specialist_{timeframe}.zip"
-            exit_model_generalist.save(specialist_exit_path)
-            print(f"  -> ✅ Zapisano model wyjścia: {specialist_exit_path.name}")
-
-        except Exception as e:
-            print(f"❌ Błąd podczas dostrajania dla {timeframe}: {e}")
-
-    # --- FAZA 4: Końcowa Analiza (z użyciem Modeli Specjalistycznych) ---
-    print("\n" + "="*50); print("📊 FAZA 4: Końcowa analiza z użyciem modeli SPECJALISTYCZNYCH..."); print("="*50 + "\n")
-    
-    all_trades_list = []
     try:
         for timeframe in all_timeframes:
-            pairs_for_timeframe = [p for p, tfs in files_structure.items() if timeframe in tfs and p in testing_tickers]
-            if not pairs_for_timeframe: continue
+            # Używamy validation_tickers!
+            pairs = [p for p, tfs in files_structure.items() if timeframe in tfs and p in validation_tickers]
+            if not pairs: continue
             
-            print(f"\n--- Analiza końcowa dla: {timeframe} ---")
+            logging.info(f"  -> Optymalizacja {timeframe} na {len(pairs)} parach walidacyjnych.")
+            optimize_timeframe_group(entry_model, exit_model, pairs, timeframe, n_trials=20, storage_dir=SCRIPT_DIR)
             
-            try:
-                study_name = f"study_{timeframe}_group_exit_manager"
-                storage_name = "postgresql://postgres:twojehaslo@localhost:5432/optuna_db"
-                study = optuna.load_study(study_name=study_name, storage=storage_name)
-                best_params = study.best_params
-                
-                specialist_entry_path = models_dir / f"ai_entry_strategist_model_specialist_{timeframe}.zip"
-                specialist_exit_path = models_dir / f"ai_exit_manager_model_specialist_{timeframe}.zip"
+    except KeyboardInterrupt:
+        logging.warning("Przerwano optymalizację.")
 
-                if not specialist_entry_path.exists() or not specialist_exit_path.exists():
-                    print(f"  -> OSTRZEŻENIE: Brak modeli specjalistycznych dla {timeframe}. Pomijanie analizy.")
-                    continue
-                    
-                print(f"  -> Ładowanie modeli specjalistycznych dla {timeframe} (na CPU)...")
-                
-                entry_model_specialist = PPO.load(specialist_entry_path, env=temp_entry_env, device="cpu")
-                exit_model_specialist = PPO.load(specialist_exit_path, env=temp_exit_env, device="cpu")
-                
-                print(f"  -> Uruchamianie symulacji na grupie testowej (z modelami specjalistycznymi na CPU)...")
-                
-                for pair in pairs_for_timeframe:
-                    sim_result = run_simulation(
-                        best_params, 
-                        pair, 
-                        timeframe, 
-                        entry_model_specialist,  
-                        exit_model_specialist    
-                    )
-                    all_trades_list.extend(sim_result['trades'])
-                    
-            except Exception as e:
-                print(f"Błąd wczytywania lub ponownego uruchamiania symulacji dla {timeframe}: {e}")
+    # --- FAZA 3: Analiza końcowa (Zbiór Testowy - Out of Sample) ---
+    logging.info("📊 FAZA 3: Analiza końcowa (Zbiór Testowy)...")
+    
+    db_url = f"sqlite:///{SCRIPT_DIR}/optuna_studies.db"
+    all_trades_list = []
+    
+    for timeframe in all_timeframes:
+        # Używamy testing_tickers! To dane, których system nigdy nie widział.
+        pairs = [p for p, tfs in files_structure.items() if timeframe in tfs and p in testing_tickers]
+        if not pairs: continue
         
-        if not all_trades_list:
-            print("Nie zebrano żadnych transakcji do końcowej analizy.")
-            return
+        logging.info(f"  -> Testowanie {timeframe} na {len(pairs)} parach testowych.")
+        
+        study_name = f"study_{timeframe}_group_exit_manager"
+        try:
+            study = optuna.load_study(study_name=study_name, storage=db_url)
+            best_params = {**base_params, **study.best_params}
+        except:
+            logging.warning(f"Brak badania dla {timeframe}, używam domyślnych.")
+            best_params = base_params
 
-        print(f"✅ Zebrano łącznie {len(all_trades_list)} transakcji do analizy.")
+        # (Pominięto tutaj Fine-Tuning dla uproszczenia kodu, używamy Generalist + Best Params)
         
+        for pair in pairs:
+            res = run_simulation(best_params, pair, timeframe, entry_model, exit_model)
+            all_trades_list.extend(res['trades'])
+
+    if all_trades_list:
         results_df = pd.DataFrame(all_trades_list)
+        if 'timeframe' in results_df.columns:
+            results_df.rename(columns={'timeframe': 'Timeframe', 'pair': 'Pair'}, inplace=True)
+        
         results_df.dropna(subset=['exit_price', 'avg_price'], inplace=True)
-
-        if results_df.empty:
-            print("Brak zakończonych transakcji do analizy.")
-            return
-
+        
         results_df['PnL'] = 0.0
         longs = results_df['side'] == 'long'
         shorts = results_df['side'] == 'short'
+        # Uwzględnienie prowizji w PnL procentowym
+        fee_pct = 0.06
+        results_df.loc[longs, 'PnL'] = (((results_df['exit_price'] - results_df['avg_price']) / results_df['avg_price']) * 100) - fee_pct
+        results_df.loc[shorts, 'PnL'] = (((results_df['avg_price'] - results_df['exit_price']) / results_df['avg_price']) * 100) - fee_pct
         
-        results_df.loc[longs, 'PnL'] = ((results_df['exit_price'] - results_df['avg_price']) / results_df['avg_price']) * 100
-        results_df.loc[shorts, 'PnL'] = ((results_df['avg_price'] - results_df['exit_price']) / results_df['avg_price']) * 100
-        
+        # Nowa funkcja analityczna z wykresem
         analyze_by_market_cap(results_df, market_caps)
-
-    except Exception as e:
-        print(f"Krytyczny błąd w Fazie 4 (Analiza): {e}")
+    else:
+        logging.warning("Brak transakcji do analizy.")
 
 if __name__ == "__main__":
     multiprocessing.freeze_support()
