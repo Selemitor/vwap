@@ -2,9 +2,8 @@
 import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
-from stable_baselines3 import PPO
-
-# <<< POPRAWKA: Importujemy wskaźniki, aby sprawdzić, czy istnieją >>>
+# ZMIANA: Import RecurrentPPO
+from sb3_contrib import RecurrentPPO
 from indicators import add_atr, add_trendline_features, add_temporal_features
 
 class ExitManagerEnv(gym.Env):
@@ -133,11 +132,15 @@ class ExitManagerEnv(gym.Env):
         return self._next_observation(), reward, done, False, {}
 
 def train_exit_manager(df, params, timesteps=75000, save_path="ai_exit_manager_model.zip"):
-    print("🤖 Rozpoczynanie treningu Agenta AI (Wyjście, 16 cech, 4 akcje)...")
+    print("🧠 Rozpoczynanie treningu Agenta AI (Wyjście, LSTM + 16 cech)...")
     df.ffill(inplace=True); df.bfill(inplace=True)
     env = ExitManagerEnv(df, params)
-    model = PPO("MlpPolicy", env, verbose=0)
+    
+    # ZMIANA: RecurrentPPO zamiast zwykłego PPO
+    # Dodajemy ent_coef=0.05
+    model = RecurrentPPO("MlpLstmPolicy", env, verbose=1, ent_coef=0.05)
+    
     model.learn(total_timesteps=timesteps)
     model.save(save_path)
-    print(f"✅ Trening Menedżera Wyjścia zakończony. Model zapisany jako '{save_path}'.")
+    print(f"✅ Trening Menedżera Wyjścia (LSTM) zakończony. Model '{save_path}' zapisany.")
     return model
